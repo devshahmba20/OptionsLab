@@ -14,13 +14,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import duckdb
 import base64
-AUTH_USER = "Option Lab"
-AUTH_PASS = "1985"
+AUTH_USER = os.environ.get("OL_USER", "Option Lab")     # Render > Environment ma OL_USER / OL_PASS mukjo
+AUTH_PASS = os.environ.get("OL_PASS", "1985")
 
 RAW, PQ = "bhavcopy", os.path.join("data", "parquet")
 
 # ---------------------------------------------------------------- BUILD
 IPQ = os.path.join("data", "idx")
+AR = os.path.join("data", "archive")          # compact monthly files (python optlab.py compact)
+ARJ = os.path.join(AR, "dates.json")
 NEW_SQL = """SELECT '{x}' AS exch, CAST(TradDt AS DATE) AS date, TckrSymb AS sym,
     CASE FinInstrmTp WHEN 'IDO' THEN 'idx' ELSE 'stk' END AS kind, CAST(XpryDt AS DATE) AS exp,
     CAST(StrkPric AS DOUBLE) AS strike, OptnTp AS ot,
@@ -29,15 +31,14 @@ NEW_SQL = """SELECT '{x}' AS exch, CAST(TradDt AS DATE) AS date, TckrSymb AS sym
     COALESCE(TRY_CAST(TtlTradgVol AS BIGINT),0) AS vol, TRY_CAST(NewBrdLotQty AS INTEGER) AS lot
     FROM read_csv(?, all_varchar=true, header=true, ignore_errors=true)
     WHERE FinInstrmTp IN ('IDO','STO') AND OptnTp IN ('CE','PE')"""
-OLD_SQL = """SELECT '{x}' AS exch, CAST(strptime(TIMESTAMP,'%d-%b-%Y') AS DATE) AS date, SYMBOL AS sym,
-    CASE INSTRUMENT WHEN 'OPTIDX' THEN 'idx' ELSE 'stk' END AS kind,
-    CAST(strptime(EXPIRY_DT,'%d-%b-%Y') AS DATE) AS exp, CAST(STRIKE_PR AS DOUBLE) AS strike, OPTION_TYP AS ot,
-    COALESCE(NULLIF(TRY_CAST(CLOSE AS DOUBLE),0), TRY_CAST(SETTLE_PR AS DOUBLE), 0) AS close,
-    CAST(NULL AS DOUBLE) AS und, COALESCE(TRY_CAST(OPEN_INT AS BIGINT),0) AS oi,
-    COALESCE(TRY_CAST(CONTRACTS AS BIGINT),0) AS vol, CAST(NULL AS INTEGER) AS lot
+NEW_SQL = """SELECT '{x}' AS exch, CAST(TradDt AS DATE) AS date, TckrSymb AS sym,
+    CASE FinInstrmTp WHEN 'IDO' THEN 'idx' ELSE 'stk' END AS kind, CAST(XpryDt AS DATE) AS exp,
+    CAST(StrkPric AS DOUBLE) AS strike, OptnTp AS ot,
+    COALESCE(NULLIF(TRY_CAST(ClsPric AS DOUBLE),0), TRY_CAST(SttlmPric AS DOUBLE), 0) AS close,
+    TRY_CAST(UndrlygPric AS DOUBLE) AS und
     FROM read_csv(?, all_varchar=true, header=true, ignore_errors=true)
-    WHERE INSTRUMENT IN ('OPTIDX','OPTSTK') AND OPTION_TYP IN ('CE','PE')"""
-
+    WHERE FinInstrmTp IN ('IDO','STO') AND OptnTp IN ('CE','PE')
+    AND COALESCE(TRY_CAST(TtlTradgVol AS BIGINT),0) > 0"""
 def _rm(f, keep):
     if not keep:
         try: os.remove(f)
@@ -94,7 +95,7 @@ def build_idx(con, keep=False):
 
 # ---------------------------------------------------------------- UPDATE (history + daily)
 def latest_date():
-    ds = [_fd(f) for f in glob.glob(os.path.join(PQ, "NSE_*.parquet"))]
+    ds = [_fd(f) for f in glob.glob(os.path.join(PQ, "NSE_*.parquet"))] + _arch_dates("NSE")
     return max(ds) if ds else None
 
 def update(start=None, keep=False, workers=4, bse=False, retry=False):
@@ -116,6 +117,64 @@ def update(start=None, keep=False, workers=4, bse=False, retry=False):
         s = e + timedelta(days=1)
     print("\nUpdate complete. Latest NSE date:", latest_date())
 
+
+# ---------------------------------------------------------------- COMPACT (daily Parquet -> monthly archive, nano size)
+def _mb(p): return os.path.getsize(p) / 1e6
+
+def compact(keep_days=60, level=19, otm=0.0, no_stocks=False, minpx=0.0, delete=False):
+    """data/parquet ni juni daily files -> data/archive/<EXCH>_<YYYYMM>.parquet (sorted, ZSTD). Chhella keep_days na divas daily j rahe.
+    Default LOSSLESS. otm/no_stocks/minpx = rows ochhi karva (lossy). Delete fakat verify pachhi, ane --delete hoy to j."""
+    from datetime import date, timedelta
+    os.makedirs(AR, exist_ok=True)
+    cutoff = (date.today() - timedelta(days=keep_days)).isoformat()
+    flt = (["kind <> 'stk'"] if no_stocks else []) + ([f"(und IS NULL OR und <= 0 OR abs(strike / und - 1) <= {otm / 100})"] if otm else []) + ([f"close >= {minpx}"] if minpx else [])
+    W = " WHERE " + " AND ".join(flt) if flt else ""
+    groups = {}
+    for f in glob.glob(os.path.join(PQ, "*.parquet")):
+        d = _fd(f)
+        if d < cutoff:
+            groups.setdefault((os.path.basename(f).split("_")[0], d[:4] + d[5:7]), []).append(f)
+    if not groups:
+        print(f"Compact karva jevi juni daily file nathi (cutoff {cutoff}, keep-days {keep_days})."); return
+    try: meta = json.load(open(ARJ))
+    except Exception: meta = {}
+    con = duckdb.connect(); tot_in = tot_out = 0.0; ok_files = []
+    for (ex, ym), L in sorted(groups.items()):
+        L = sorted(L); fin = os.path.join(AR, f"{ex}_{ym}.parquet"); tmp = fin + ".tmp"; merged = os.path.exists(fin)
+        dts = {_fd(f) for f in L}
+        q = f"SELECT * FROM read_parquet({_lst(L)}, union_by_name=true)"
+        if os.path.exists(fin):          # pehlathi archive hoy to e mahino merge (same date replace)
+            q += f" UNION ALL BY NAME SELECT * FROM read_parquet('{fin.replace(chr(92), '/')}') WHERE date NOT IN ({','.join(repr(d) for d in sorted(dts))})"
+        sel = f"SELECT * FROM ({q}) t{W}"
+        for opt in (f"COMPRESSION ZSTD, COMPRESSION_LEVEL {level}, PARQUET_VERSION V2, ROW_GROUP_SIZE 500000", f"COMPRESSION ZSTD, COMPRESSION_LEVEL {level}", "COMPRESSION ZSTD"):
+            try:
+                con.execute(f"COPY ({sel} ORDER BY sym, exp, strike, ot, date) TO '{tmp.replace(chr(92), '/')}' (FORMAT PARQUET, {opt})"); break
+            except Exception as e:
+                if os.path.exists(tmp): os.remove(tmp)
+                last_err = e
+        else:
+            print(f"{ex} {ym}: ERROR {last_err}"); continue
+        n1 = con.execute(f"SELECT count(*) FROM ({sel})").fetchone()[0]
+        n2 = con.execute(f"SELECT count(*) FROM read_parquet('{tmp.replace(chr(92), '/')}')").fetchone()[0]
+        bad = con.execute(f"SELECT count(*) FROM (SELECT * FROM ({sel}) EXCEPT ALL SELECT * FROM read_parquet('{tmp.replace(chr(92), '/')}'))").fetchone()[0]
+        if n1 != n2 or bad:
+            os.remove(tmp); print(f"{ex} {ym}: VERIFY FAIL ({n1} vs {n2}, diff {bad}) - skip"); continue
+        os.replace(tmp, fin)
+        a, b = sum(_mb(f) for f in L), _mb(fin)
+        if not merged: tot_in += a; tot_out += b
+        meta[ex] = sorted(set(meta.get(ex, [])) | dts); ok_files += L
+        print(f"{ex} {ym}: {len(L):3d} files {a:8.1f} MB -> {b:7.1f} MB  ({a / max(b, 1e-9):.1f}x, rows {n1:,})" if not merged else f"{ex} {ym}: {len(L)} nayi file merge thai, archive have {b:.1f} MB (rows {n1:,})")
+    json.dump(meta, open(ARJ, "w"))
+    if tot_out:
+        print(f"\nTotal: {tot_in:.0f} MB -> {tot_out:.0f} MB  ({tot_in / tot_out:.1f}x smaller)")
+    if delete and ok_files:
+        for f in ok_files: os.remove(f)
+        print(f"{len(ok_files)} juni daily files delete thai (archive ma verify thai gayi chhe).")
+    elif ok_files:
+        print("Daily files haju rakhi chhe (app archive vaparshe, duplicate nahi). Size ghatadvi hoy to: --delete sathe pharī chalavo.")
+    ar = sum(_mb(f) for f in glob.glob(os.path.join(AR, "*.parquet"))); dl_ = sum(_mb(f) for f in glob.glob(os.path.join(PQ, "*.parquet")))
+    print(f"Hamna: archive {ar:.0f} MB + daily {dl_:.0f} MB")
+
 # ---------------------------------------------------------------- QUERY
 def _fd(f):
     t = re.search(r"_(\d{8})\.parquet$", f).group(1)
@@ -124,18 +183,35 @@ def _fd(f):
 def _lst(fs):
     return "[" + ",".join("'" + f.replace("\\", "/").replace("'", "''") + "'" for f in fs) + "]"
 
+def _arch_dates(exch=None):
+    try:
+        j = json.load(open(ARJ))
+        return sorted({d for k, v in j.items() if exch in (None, k) for d in v})
+    except Exception:
+        return []
+
+def all_dates():
+    return sorted({_fd(f) for f in glob.glob(os.path.join(PQ, "*.parquet"))} | set(_arch_dates()))
+
+def _fm(f):
+    t = re.search(r"_(\d{6})\.parquet$", f).group(1); return f"{t[:4]}-{t[4:]}"
+
 def db(a=None, b=None, last=0):
-    """Fakat jaruri date-range ni Parquet files vanche (2019 thi aaj sudhi na data ma pan fast)."""
-    fs = glob.glob(os.path.join(PQ, "*.parquet"))
-    if a: fs = [f for f in fs if _fd(f) >= a]
-    if b: fs = [f for f in fs if _fd(f) <= b]
-    if last:
-        keep = sorted({_fd(f) for f in fs})[-last:]
-        fs = [f for f in fs if _fd(f) in keep]
-    if not fs:
+    """Fakat jaruri date-range ni files vanche: daily Parquet (data/parquet) + compact monthly archive (data/archive)."""
+    ds = all_dates()
+    if a: ds = [d for d in ds if d >= a]
+    if b: ds = [d for d in ds if d <= b]
+    if last: ds = ds[-last:]
+    if not ds:
         raise RuntimeError("Aa date range ma Parquet data nathi. Pehla 'python optlab.py update' chalavo.")
+    dset, ad = set(ds), set(_arch_dates())
+    fs = [f for f in glob.glob(os.path.join(PQ, "*.parquet")) if _fd(f) in dset and _fd(f) not in ad]
+    af = [f for f in glob.glob(os.path.join(AR, "*.parquet")) if ds[0][:7] <= _fm(f) <= ds[-1][:7]]
     con = duckdb.connect()
-    con.execute(f"CREATE VIEW opt AS SELECT * FROM read_parquet({_lst(fs)}, union_by_name=true)")
+    where = ""
+    if af and (a or b or last):
+        where = " WHERE date IN (" + ",".join(f"'{d}'" for d in ds) + ")" if last else f" WHERE date BETWEEN '{ds[0]}' AND '{ds[-1]}'"
+    con.execute(f"CREATE VIEW opt AS SELECT * FROM read_parquet({_lst(fs + af)}, union_by_name=true){where}")
     ix = [f for f in glob.glob(os.path.join(IPQ, "*.parquet")) if (not a or _fd(f) >= a) and (not b or _fd(f) <= b)]
     if ix:
         con.execute(f"CREATE VIEW idx AS SELECT * FROM read_parquet({_lst(ix)}, union_by_name=true)")
@@ -144,11 +220,12 @@ def db(a=None, b=None, last=0):
     return con
 
 def api_symbols(q, con):
-    r = con.execute("SELECT sym, any_value(kind), any_value(exch), any_value(lot) FROM opt GROUP BY sym ORDER BY 2, 1").fetchall()
+    lt = "any_value(lot)" if "lot" in {x[0] for x in con.execute("DESCRIBE opt").fetchall()} else "NULL"
+    r = con.execute(f"SELECT sym, any_value(kind), any_value(exch), {lt} FROM opt GROUP BY sym ORDER BY 2, 1").fetchall()
     return [{"sym": a, "kind": b, "exch": c, "lot": d} for a, b, c, d in r]
 
 def api_dates(q, con):
-    return sorted({_fd(f) for f in glob.glob(os.path.join(PQ, "*.parquet"))})
+    return all_dates()
 
 def api_expiries(q, con):
     r = con.execute("SELECT DISTINCT exp::VARCHAR FROM opt WHERE sym=? AND date=? AND exp>=date ORDER BY 1", [q["sym"], q["date"]]).fetchall()
@@ -333,7 +410,7 @@ def api_strategy(q, con):
         if tot is not None:
             dates.append(d); pnl.append(round(tot, 2))
     sp = _spots(con, sym, d0, end)
-    lot = con.execute("SELECT max(lot) FROM opt WHERE sym=? AND date=?", [sym, d0]).fetchone()[0]
+    lot = con.execute("SELECT max(lot) FROM opt WHERE sym=? AND date=?", [sym, d0]).fetchone()[0] if "lot" in {x[0] for x in con.execute("DESCRIBE opt").fetchall()} else None
     pay = None
     if len(exps) == 1:                 # single expiry -> exact expiry payoff (piecewise linear)
         ks = sorted({l["strike"] for l in L}); sc = sum(l["qty"] for l in L if l["ot"] == "CE")
@@ -364,7 +441,7 @@ def _gk(F, K, T, px, ot, r):
     return dict(iv=v * 100, delta=g["delta"], vega=g["vega"], theta=g["theta"])
 
 def _prevd(d):
-    ds = [_fd(f) for f in glob.glob(os.path.join(PQ, "*.parquet")) if _fd(f) < d]
+    ds = [x for x in all_dates() if x < d]
     return max(ds) if ds else None
 
 def api_diag(q, con):
@@ -706,14 +783,21 @@ def serve(port):
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["build", "serve", "update"])
+    ap.add_argument("cmd", choices=["build", "serve", "update", "compact"])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--from", dest="start", help="update mate start date YYYY-MM-DD (default: last date thi, pehli vaar 2019-01-01)")
     ap.add_argument("--keep-csv", action="store_true", help="CSV delete na karo")
     ap.add_argument("--bse", action="store_true", help="update ma BSE pan")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--retry-missing", action="store_true")
+    ap.add_argument("--keep-days", type=int, default=60, help="compact: chhella N divas daily file rakho")
+    ap.add_argument("--level", type=int, default=19, help="compact: ZSTD level (1-22)")
+    ap.add_argument("--otm", type=float, default=0, help="compact: fakat strike +-N%% (underlying thi) rakho (lossy)")
+    ap.add_argument("--no-stocks", action="store_true", help="compact: stock options kadhi nakho (lossy)")
+    ap.add_argument("--minpx", type=float, default=0, help="compact: close < N vala rows kadhi nakho (lossy)")
+    ap.add_argument("--delete", action="store_true", help="compact: verify pachhi juni daily files delete")
     a = ap.parse_args()
     if a.cmd == "build": build(a.keep_csv)
+    elif a.cmd == "compact": compact(a.keep_days, a.level, a.otm, a.no_stocks, a.minpx, a.delete)
     elif a.cmd == "update": update(a.start, a.keep_csv, a.workers, a.bse, a.retry_missing)
     else: serve(a.port)

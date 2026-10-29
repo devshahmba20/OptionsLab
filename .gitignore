@@ -1,0 +1,4 @@
+bhavcopy/ 
+data/ 
+*.log 
+__pycache__/ 

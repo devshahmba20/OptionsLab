@@ -700,9 +700,9 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
-
 def serve(port):
-    print(f"Dashboard: http://localhost:{port}   (band karva Ctrl+C)")
+    port = int(os.environ.get("PORT", port))
+    print(f"Dashboard: http://0.0.0.0:{port}")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

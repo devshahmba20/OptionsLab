@@ -1,0 +1,40 @@
+name: Daily Bhavcopy Update
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'   # 7:30 PM IST (Mon-Fri)
+  workflow_dispatch:          # Manual run pan kari sakay
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install duckdb
+        run: pip install duckdb
+
+      - name: Download + convert last 15 days
+        run: |
+          FROM=$(date -u -d '15 days ago' +%Y-%m-%d)
+          echo "Updating from $FROM"
+          python optlab.py update --from $FROM --bse --workers 2
+
+      - name: Commit new data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/
+          if git diff --staged --quiet; then
+            echo "No new data"
+          else
+            git commit -m "data: update $(date -u +%Y-%m-%d)"
+            git push
+          fi

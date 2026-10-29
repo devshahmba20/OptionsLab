@@ -13,6 +13,9 @@ import sys, os, re, json, glob, argparse, math
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import duckdb
+import base64
+AUTH_USER = "Option Lab"
+AUTH_PASS = "1985"
 
 RAW, PQ = "bhavcopy", os.path.join("data", "parquet")
 
@@ -657,7 +660,24 @@ loadSyms();
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
+
+    def _auth_ok(self):
+        h = self.headers.get("Authorization", "")
+        if not h.startswith("Basic "):
+            return False
+        try:
+            u, p = base64.b64decode(h[6:]).decode().split(":", 1)
+            return u == AUTH_USER and p == AUTH_PASS
+        except Exception:
+            return False
+
     def do_GET(self):
+        if not self._auth_ok():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Options Lab"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         u = urlparse(self.path)
         if u.path == "/":
             return self._send(200, HTML.encode(), "text/html; charset=utf-8")
@@ -673,14 +693,17 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             body, code = json.dumps({"error": str(e)}), 400
         self._send(code, body.encode(), "application/json")
+
     def _send(self, code, b, ct):
-        self.send_response(code); self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        self.send_response(code)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
 
 def serve(port):
     print(f"Dashboard: http://localhost:{port}   (band karva Ctrl+C)")
-    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
-
+    ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["build", "serve", "update"])

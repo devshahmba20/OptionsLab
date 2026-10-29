@@ -2,8 +2,11 @@ name: Daily Bhavcopy Update
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'   # 7:30 PM IST (Mon-Fri)
-  workflow_dispatch:          # Manual run pan kari sakay
+    # 7:30 PM, 8:30 PM, 9:30 PM IST (every day including Sat/Sun)
+    - cron: '0 14 * * *'
+    - cron: '0 15 * * *'
+    - cron: '0 16 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write

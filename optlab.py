@@ -208,6 +208,12 @@ def db(a=None, b=None, last=0):
     fs = [f for f in glob.glob(os.path.join(PQ, "*.parquet")) if _fd(f) in dset and _fd(f) not in ad]
     af = [f for f in glob.glob(os.path.join(AR, "*.parquet")) if ds[0][:7] <= _fm(f) <= ds[-1][:7]]
     con = duckdb.connect()
+    try:
+        con.execute(f"SET memory_limit='{os.environ.get('OL_MEM', '300MB')}'")
+        con.execute("SET threads TO 2")
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
     where = ""
     if af and (a or b or last):
         where = " WHERE date IN (" + ",".join(f"'{d}'" for d in ds) + ")" if last else f" WHERE date BETWEEN '{ds[0]}' AND '{ds[-1]}'"
@@ -655,12 +661,15 @@ def _cbt_load(con, c):
     con.execute("CREATE OR REPLACE TEMP TABLE sp(date DATE, spot DOUBLE)")
     con.executemany("INSERT INTO sp VALUES (CAST(? AS DATE), ?)", [(d, v) for d, v in sp.items() if d in alld])
     ots = sorted({o for o, _ in c["legs"]})
-    rows = con.execute(f"""SELECT o.date::VARCHAR, o.exp::VARCHAR, o.strike, o.ot, o.close, o.vol, o.oi FROM opt o JOIN sp ON o.date=sp.date
+    cur = con.execute(f"""SELECT o.date::VARCHAR, o.exp::VARCHAR, o.strike, o.ot, o.close, o.vol, o.oi FROM opt o JOIN sp ON o.date=sp.date
         WHERE o.sym=? AND o.ot IN ({','.join('?' * len(ots))}) AND o.close>0 AND o.exp>o.date AND date_diff('day', o.date, o.exp) <= ?
-        AND abs(o.strike/sp.spot-1) <= 0.06""", [sym] + ots + [c["fh"] + 7]).fetchall()
+        AND abs(o.strike/sp.spot-1) <= 0.06""", [sym] + ots + [c["fh"] + 7])
     P, ex, ks = {}, {}, {}
-    for d, e, k, ot, cl, vo, oi in rows:
-        P[(d, e, k, ot)] = (cl, vo or 0, oi or 0); ex.setdefault(d, set()).add(e); ks.setdefault((d, e, ot), set()).add(k)
+    while True:
+        rows = cur.fetchmany(50000)
+        if not rows: break
+        for d, e, k, ot, cl, vo, oi in rows:
+            P[(d, e, k, ot)] = (cl, vo or 0, oi or 0); ex.setdefault(d, set()).add(e); ks.setdefault((d, e, ot), set()).add(k)
     vix = dict(con.execute("SELECT date::VARCHAR, close FROM idx WHERE lower(name)=lower(?) AND date BETWEEN ? AND ?", [VIXNAME, a, b]).fetchall())
     return sp, P, ex, ks, vix, est, len(miss)
 
@@ -847,9 +856,14 @@ def api_cst(q, con):
     con.execute("CREATE OR REPLACE TEMP TABLE sp(date DATE, spot DOUBLE)"); con.executemany("INSERT INTO sp VALUES (CAST(? AS DATE), ?)", [(d, v) for d, v in sp.items() if d in alld])
     con.execute("CREATE OR REPLACE TEMP TABLE se(date DATE, exp DATE)"); con.executemany("INSERT INTO se VALUES (CAST(? AS DATE), CAST(? AS DATE))", sel)
     P, ks = {}, {}
-    for d, e, k, ot, cl, vo in con.execute("""SELECT o.date::VARCHAR, o.exp::VARCHAR, o.strike, o.ot, o.close, o.vol FROM opt o JOIN sp ON o.date=sp.date
-            JOIN se ON o.date=se.date AND o.exp=se.exp WHERE o.sym=? AND o.close>0 AND abs(o.strike/sp.spot-1) <= 0.10""", [sym]).fetchall():
-        P[(d, e, k, ot)] = (cl, vo or 0); ks.setdefault((d, e, ot), set()).add(k)
+    band = max(abs(x) for x in c["offs"]) + 400          # fakat jaruri strikes (spot +- offset +- 400 pts), memory bachave
+    cur = con.execute("""SELECT o.date::VARCHAR, o.exp::VARCHAR, o.strike, o.ot, o.close, o.vol FROM opt o JOIN sp ON o.date=sp.date
+            JOIN se ON o.date=se.date AND o.exp=se.exp WHERE o.sym=? AND o.close>0 AND abs(o.strike-sp.spot) <= ?""", [sym, band])
+    while True:
+        chunk = cur.fetchmany(50000)
+        if not chunk: break
+        for d, e, k, ot, cl, vo in chunk:
+            P[(d, e, k, ot)] = (cl, vo or 0); ks.setdefault((d, e, ot), set()).add(k)
     dts = sorted(d for d in alld if d in sp); od = [_o(d) for d in dts]
     if not dts: raise ValueError("Data nathi.")
     def entry(d, spec):
@@ -1278,7 +1292,7 @@ Tame ek <b>fixed idea</b> aapo: jem ke "<b>Near = 2jo monthly expiry (29-Dec) SE
 <div id="csout"></div></div>
 <script>
 const $=s=>document.querySelector(s);
-async function api(p,q){const r=await fetch(p+'?'+new URLSearchParams(q));const j=await r.json();if(j.error)throw new Error(j.error);return j}
+async function api(p,q){const r=await fetch(p+'?'+new URLSearchParams(q));const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){throw new Error(!t.trim()?'Server e khali jawab apyo (HTTP '+r.status+'). Lagbhag server ni memory puri thai gai ke restart thayu. Nano From-To range lo (jem 1-2 varsh) ane fari try karo.':'Server no jawab JSON nathi (HTTP '+r.status+'): '+t.slice(0,150).replace(/<[^>]*>/g,' '))}if(j.error)throw new Error(j.error);return j}
 const msg=t=>$('#msg').textContent=t||'';
 function fill(el,a,sel){el.innerHTML=a.map(x=>`<option>${x}</option>`).join('');if(sel&&a.includes(sel))el.value=sel}
 async function loadSyms(){try{const s=await api('/api/symbols',{});fill($('#sym'),s.map(x=>x.sym),'NIFTY');await loadDates()}catch(e){msg(e.message)}}
@@ -1577,6 +1591,13 @@ loadSyms();
 
 </script></body></html>"""
 
+def _nn(o):
+    """NaN/Infinity JSON ma invalid che (browser 'Unexpected token' / khali) -> None"""
+    if isinstance(o, float): return o if math.isfinite(o) else None
+    if isinstance(o, dict): return {k: _nn(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)): return [_nn(v) for v in o]
+    return o
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -1604,13 +1625,24 @@ class H(BaseHTTPRequestHandler):
         if not fn:
             return self._send(404, b'{"error":"not found"}', "application/json")
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        con = None
         try:
             sc = SCOPE[u.path](q)
             con = db(*sc) if sc else None
-            body = json.dumps(fn(q, con))
+            body = json.dumps(_nn(fn(q, con)), allow_nan=False)
             code = 200
+        except MemoryError:
+            body, code = json.dumps({"error": "Server ni memory puri thai gai. Nano From-To range lo ke offsets/hold days ochha karo."}), 400
         except Exception as e:
-            body, code = json.dumps({"error": str(e)}), 400
+            msg = str(e)
+            if "memory" in msg.lower() or "OutOfMemory" in type(e).__name__:
+                msg = "Memory puri thai gai (" + msg[:120] + "). Nano From-To range lo."
+            body, code = json.dumps({"error": msg}), 400
+        finally:
+            try:
+                if con: con.close()
+            except Exception: pass
+            import gc; gc.collect()
         self._send(code, body.encode(), "application/json")
 
     def _send(self, code, b, ct):
@@ -1618,7 +1650,8 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ct)
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
-        self.wfile.write(b)
+        try: self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError): pass
 def serve(port):
     port = int(os.environ.get("PORT", port))
     print(f"Dashboard: http://0.0.0.0:{port}")

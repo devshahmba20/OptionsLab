@@ -579,7 +579,8 @@ def api_parity(q, con):
     allS = sorted({p[0] for pl in plans for p in pl["pairs"]}); allN = sorted({p[1] for pl in plans for p in pl["pairs"]})
     P = {}
     for sym, ex, ks in ((ss, es, allS), (ns, en, allN)):
-        for d, k, ot, c, v in con.execute(f"SELECT date::VARCHAR, strike, ot, close, vol FROM opt WHERE sym=? AND exp=? AND date BETWEEN ? AND ? AND strike IN ({','.join('?'*len(ks))}) AND close>0",
+        _vc = "vol" if "vol" in {x[0] for x in con.execute("DESCRIBE opt").fetchall()} else "0"
+        for d, k, ot, c, v in con.execute(f"SELECT date::VARCHAR, strike, ot, close, {_vc} FROM opt WHERE sym=? AND exp=? AND date BETWEEN ? AND ? AND strike IN ({','.join('?'*len(ks))}) AND close>0",
                                           [sym, ex, pd_ or d0, end] + ks).fetchall():
             P[(sym, d, k, ot)] = (c, v)
     HASLOT = "lot" in {x[0] for x in con.execute("DESCRIBE opt").fetchall()}
@@ -608,7 +609,7 @@ def api_parity(q, con):
                 "ivs": rd(gs[0] * 100, 2) if gs else None, "ivn": rd(gn[0] * 100, 2) if gn else None,
                 "ds": rd(gs[1]["delta"], 4) if gs else None, "dn": rd(gn[1]["delta"], 4) if gn else None,
                 "ths": rd(gs[1]["theta"], 3) if gs else None, "thn": rd(gn[1]["theta"], 3) if gn else None,
-                "vs": rd(a[1] / lotS, 0), "vn": rd(b[1] / lotN, 0)})
+                "vs": rd((a[1] or 0) / lotS, 0), "vn": rd((b[1] or 0) / lotN, 0)})
         blocks.append({"ot": ot, "k": K, "label": pl["label"], "snap": snap, "series": series})
     v = con.execute("SELECT close FROM idx WHERE date=? AND lower(name)=lower(?)", [d0, VIXNAME]).fetchone()
     info = {"date": d0, "es": es, "en": en, "gapdays": (_D.fromisoformat(es) - _D.fromisoformat(en)).days,
